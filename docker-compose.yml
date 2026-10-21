@@ -1,0 +1,38 @@
+services:
+  mlflow:
+    build: ./mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow-data
+    # depends_on alone only waits for the container to START.
+    # This healthcheck lets other services wait until the server ANSWERS.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  inference:
+    build: .
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    # serve.py exits if models:/food11@champion cannot be loaded
+    # (e.g. registry still empty) - restart until it succeeds.
+    restart: on-failure
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8501:8501"
+    environment:
+      INFERENCE_URL: http://inference:8000
+    depends_on:
+      - inference
+
+volumes:
+  mlflow-data:
