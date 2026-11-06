@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from src.food11.promote import gate, standard_error
+from src.food11.promote import comparison_problem, gate, standard_error
 
 
 def test_standard_error():
@@ -24,3 +24,22 @@ def test_slightly_better_candidate_is_not_promoted():
 def test_worse_candidate_is_not_promoted():
     promote, _, _ = gate(acc_candidate=0.40, acc_champion=0.75, n=1096)
     assert not promote
+
+
+def test_same_test_set_is_comparable():
+    params = {"dataset": "mini", "test_set_md5": "abc"}
+    assert comparison_problem(params, dict(params)) is None
+
+
+def test_runs_without_fingerprint_stay_comparable():
+    # two older runs, both measured before test_set_md5 existed
+    assert comparison_problem({"dataset": "mini"}, {"dataset": "mini"}) is None
+
+
+def test_different_test_sets_are_not_comparable():
+    assert comparison_problem(
+        {"dataset": "mini", "test_set_md5": "old"}, {"dataset": "mini", "test_set_md5": "new"}
+    )
+    # old champion without fingerprint vs new candidate with one (data changed)
+    assert comparison_problem({"dataset": "mini"}, {"dataset": "mini", "test_set_md5": "new"})
+    assert comparison_problem({"dataset": "mini"}, {"dataset": "processed"})
