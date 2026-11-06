@@ -31,6 +31,8 @@ PRESETS = {
         "lr": 0.0001,
         "batch_size": 32,
         "val_accuracy": 0.7263,
+        "test_accuracy": 0.7518248175182481,  # 824 / 1096 on the mini evaluation split
+        "test_loss": 0.7436415672737317,
     },
     "runner-up": {
         "model_id": "m-f724849858784d7898be7c01dc5f8a00",
@@ -39,6 +41,8 @@ PRESETS = {
         "lr": 0.001,
         "batch_size": 64,
         "val_accuracy": 0.6122,
+        "test_accuracy": 0.6642335766423357,  # 728 / 1096 on the mini evaluation split
+        "test_loss": 1.3641694466563037,
     },
 }
 
@@ -77,9 +81,18 @@ def main():
                 "lr": preset["lr"],
                 "batch_size": preset["batch_size"],
                 "model": "resnet18",
+                # Same keys as train.py, so promote.py can compare this run with new ones.
+                "dataset": "mini",
+                "test_size": 1096,
             }
         )
-        mlflow.log_metric("val_accuracy", preset["val_accuracy"])
+        mlflow.log_metrics(
+            {
+                "val_accuracy": preset["val_accuracy"],
+                "test_accuracy": preset["test_accuracy"],
+                "test_loss": preset["test_loss"],
+            }
+        )
 
         model_info = mlflow.pytorch.log_model(
             model,

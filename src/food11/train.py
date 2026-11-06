@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 import mlflow
@@ -36,6 +37,11 @@ def parse_args():
         type=int,
         default=32,
         help="Number of images processed together.",
+    )
+    parser.add_argument(
+        "--register",
+        action="store_true",
+        help="Also register the trained model as a new version of 'food11'.",
     )
 
     return parser.parse_args()
@@ -188,7 +194,9 @@ def main():
         if not split_path.exists():
             raise FileNotFoundError(f"Missing dataset folder: {split_path}")
 
-    mlflow.set_tracking_uri("http://127.0.0.1:5000")
+    # Same default as before, but can point to another server
+    # (e.g. the Compose mlflow service or a hosted DagsHub MLflow).
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
     mlflow.set_experiment("food11")
 
     (
@@ -223,6 +231,8 @@ def main():
                 "model": "resnet18",
                 "device": str(device),
                 "num_classes": len(train_dataset.classes),
+                # Needed by promote.py to compute the standard error of test_accuracy.
+                "test_size": len(test_dataset),
             }
         )
 
@@ -282,13 +292,16 @@ def main():
         model = model.to("cpu")
         model.eval()
 
-        mlflow.pytorch.log_model(
+        model_info = mlflow.pytorch.log_model(
             model,
             name="model",
             serialization_format="pickle",
+            registered_model_name="food11" if args.register else None,
         )
 
         print("Model saved successfully.")
+        if args.register:
+            print(f"Registered as food11 version {model_info.registered_model_version}")
 
 
 if __name__ == "__main__":
