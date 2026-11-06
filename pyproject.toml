@@ -33,3 +33,19 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+]
+
+[tool.pytest.ini_options]
+# Lets tests import the code as `src.food11...` (same as the Docker image does).
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff.lint.isort]
+# ./mlflow/ is the Compose service folder, not our package: keep mlflow third-party.
+known-third-party = ["mlflow"]

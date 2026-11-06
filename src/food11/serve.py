@@ -1,5 +1,7 @@
 import os
+from contextlib import asynccontextmanager
 from io import BytesIO
+from typing import Annotated
 
 import mlflow
 import mlflow.pyfunc
@@ -8,45 +10,51 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
 from torchvision import transforms
 
+from src.food11.data import CLASSES
 
-# The class order must match the ImageFolder class order used during training.
-CLASS_NAMES = [
-    "Bread",
-    "Dairy product",
-    "Dessert",
-    "Egg",
-    "Fried food",
-    "Meat",
-    "Noodles-Pasta",
-    "Rice",
-    "Seafood",
-    "Soup",
-    "Vegetable-Fruit",
-]
+# The class order must match the ImageFolder class order used during training
+# (alphabetical folder names, which is also the order of CLASSES).
+CLASS_NAMES = CLASSES
 
 MODEL_URI = "models:/food11@champion"
 
-# Locally this uses 127.0.0.1.
-# Docker can override it with the MLFLOW_TRACKING_URI environment variable.
-MLFLOW_TRACKING_URI = os.getenv(
-    "MLFLOW_TRACKING_URI",
-    "http://127.0.0.1:5000",
-)
+# The model is loaded once, at startup, into this module-level variable.
+# Tests replace it with a fake model.
+model = None
 
-mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
-print(f"MLflow tracking URI: {MLFLOW_TRACKING_URI}")
-print(f"Loading model: {MODEL_URI}")
+def load_model():
+    """Load the champion model from MLflow, unless SKIP_MODEL is set."""
 
-# The model is loaded once when the API starts.
-model = mlflow.pyfunc.load_model(MODEL_URI)
+    global model
 
-print("Model loaded successfully.")
+    if os.environ.get("SKIP_MODEL"):
+        print("SKIP_MODEL is set: starting without a model.")
+        return
+
+    # Locally this uses 127.0.0.1.
+    # Docker can override it with the MLFLOW_TRACKING_URI environment variable.
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+    mlflow.set_tracking_uri(tracking_uri)
+
+    print(f"MLflow tracking URI: {tracking_uri}")
+    print(f"Loading model: {MODEL_URI}")
+    model = mlflow.pyfunc.load_model(MODEL_URI)
+    print("Model loaded successfully.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Runs once when the server starts (same role as @app.on_event("startup")).
+    load_model()
+    yield
+
 
 app = FastAPI(
     title="Food-11 Classification API",
     description="Classifies uploaded food images into one of 11 categories.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 image_transform = transforms.Compose(
@@ -65,12 +73,15 @@ image_transform = transforms.Compose(
 def health():
     """Confirm that the API is running."""
 
-    return {"status": "ok"}
+    return {"status": "ok", "model_loaded": model is not None}
 
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(file: Annotated[UploadFile, File()]):
     """Classify one uploaded food image."""
+
+    if model is None:
+        raise HTTPException(status_code=503, detail="No model is loaded.")
 
     try:
         image_bytes = await file.read()
@@ -87,7 +98,7 @@ async def predict(file: UploadFile = File(...)):
 
     try:
         predictions = model.predict(image_tensor.numpy())
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - any model failure becomes a 500 with details
         raise HTTPException(
             status_code=500,
             detail=f"Prediction failed: {error}",
@@ -96,7 +107,7 @@ async def predict(file: UploadFile = File(...)):
     # The model returns raw scores called logits.
     # Softmax converts them into probabilities.
     probabilities = torch.softmax(
-        torch.as_tensor(predictions),
+        torch.as_tensor(predictions, dtype=torch.float32),
         dim=1,
     )
 
