@@ -128,13 +128,13 @@ Without `needs`, jobs run **in parallel**, on separate runners. `smoke` would st
 
 The very first run failed in 2 seconds at "Set up job": `Unable to resolve action astral-sh/setup-uv@v10, unable to find version v10`. That action no longer publishes a floating major tag, so I pinned the exact release `v10.3.3`. The runs below are the green ones on the `lab5-ci-cd` branch (the `push` job is skipped off `main`).
 
-| Run | Total | `test` job | `uv sync --frozen` | `pytest` | `smoke` job | `docker build` |
-|---|---|---|---|---|---|---|
-| #2 (commit `e162323`, cold uv cache) | 2 min 6 s | 33 s | 6 s | 13 s | 1 min 26 s | 66 s |
-| #3 (empty commit `8517375`, warm uv cache) | 2 min 8 s | 28 s | | | 1 min 34 s | |
+| Run | Total | `test` job | setup-uv | `uv sync --frozen` | `pytest` | Post setup-uv (save cache) | `smoke` job | `docker build` |
+|---|---|---|---|---|---|---|---|---|
+| #2 (commit `e162323`, cold uv cache) | 2 min 6 s | 33 s | 1 s | 6 s | 13 s | 7 s | 1 min 26 s | 66 s |
+| #3 (empty commit `8517375`, warm uv cache) | 2 min 8 s | 28 s | 6 s | **3 s** | 13 s | **1 s** | 1 min 34 s | 72 s |
 
-* **The `test` job got faster (33 s → 28 s)**, thanks to `setup-uv` with `enable-cache: true`. Run #2 saved uv's download cache at the end of the job (the "Post Run setup-uv" step, 7 s), keyed on `uv.lock`. Run #3 restored it, so `uv sync` did not download torch, mlflow, etc. again. Since `uv.lock` did not change, the cache key matched. (On GitHub's fast network the cold download is already quick, so the gain is a few seconds; on a slow network or with the CUDA build of torch it would be minutes.)
-* **The `smoke` job did not get faster** (it even varied by a few seconds). It runs a plain `docker build` on a brand-new runner: there is no layer cache from the previous run, so the base image is pulled and `uv sync` inside the Dockerfile reinstalls everything every time. That build is now the slowest step of the pipeline. The `push` job avoids this with `cache-from/cache-to: type=gha` (BuildKit layers stored in the GitHub Actions cache); the same could be added to `smoke` with `docker/build-push-action` and `load: true`.
+* **The `test` job got faster (33 s → 28 s)**, thanks to `setup-uv` with `enable-cache: true`. Run #2 started with no cache: `uv sync` downloaded every package (6 s) and the post step uploaded uv's cache (7 s), keyed on `uv.lock`. In run #3 the key matched (same `uv.lock`), so `setup-uv` restored the cache (~5 s more in that step), **`uv sync` dropped to 3 s**, and the save step was skipped (1 s). On GitHub's fast network the cold download is already quick, so the gain is only a few seconds; on a slow network, or with the multi-GB CUDA build of torch, it would be minutes.
+* **The `smoke` job did not get faster** (1 min 26 s → 1 min 34 s). It runs a plain `docker build` on a brand-new runner: there is no layer cache from the previous run, so the base image is pulled and `uv sync` inside the Dockerfile reinstalls everything every time. That build is now the slowest step of the pipeline. The `push` job avoids this with `cache-from/cache-to: type=gha` (BuildKit layers stored in the GitHub Actions cache); the same could be added to `smoke` with `docker/build-push-action` and `load: true`.
 * Total time is about **2 minutes**, dominated by the Docker build.
 
 **In simple terms: every run starts on an empty machine; only what you explicitly cache comes back, and here only the Python packages were cached.**
@@ -175,7 +175,44 @@ With `contents: read` + `packages: write`, the worst it can do is push an image 
 
 ## Question 9 - Branch protection and a failing pull request
 
-TODO
+**Rule** (Settings → Branches → branch protection rule for `main`):
+
+* ✅ Require a pull request before merging (with *Require approvals* turned **off**: on a one-person repo I cannot approve my own PR, so 1 required approval would block every merge)
+* ✅ Require status checks to pass before merging → required checks: **`test`** and **`smoke`**
+
+The rule was added after the Lab 5 code was merged to `main` through [PR #1](https://github.com/marckhat/mlops-lab-1/pull/1) (the `main` run of that merge pushed `ghcr.io/marckhat/mlops-lab-1:bbb98f6c...`; see Q12).
+
+**The broken pull request.** On a new branch `break-test` I changed `category_from_filename` to return `CLASSES[(int(label) + 1) % len(CLASSES)]` (every class shifted by one) and opened [PR #2](https://github.com/marckhat/mlops-lab-1/pull/2).
+
+The `test` job failed (on both the `push` and the `pull_request` events):
+
+```text
+    def test_category_from_filename():
+>       assert category_from_filename("0_12.jpg") == "Bread"
+E       AssertionError: assert 'Dairy product' == 'Bread'
+FAILED tests/test_data.py::test_category_from_filename - AssertionError: assert 'Dairy product' == 'Bread'
+1 failed, 18 passed, 2 warnings in 9.43s
+```
+
+**What the pull request page showed:**
+
+* a red ❌ next to the commit and a box **"Some checks were not successful - 2 failing, 4 skipped checks"**;
+* `ci / test (pull_request)` *Failing after 28s* and `ci / test (push)` *Failing after 25s*, both labelled **Required**;
+* `ci / smoke` **skipped** (because of `needs: test`, Q5) but still labelled **Required**, and `ci / push` skipped (not `main`);
+* a greyed-out **Merge pull request** button and the message *"Merging is blocked due to failing merge requirements"*.
+
+**Could I still merge?** Not normally: the button is disabled. Because I am the repository **admin**, GitHub also showed an unchecked box *"Merge without waiting for requirements to be met (bypass rules)"*. An admin can bypass on purpose; a normal collaborator cannot. Ticking *"Do not allow bypassing the above settings"* in the rule would remove that option for admins too. I did not bypass.
+
+**Fix.** I reverted the line, pushed again to the same branch: the checks re-ran on the new commit, turned green, and the PR could be merged.
+
+**What this changes for a team, compared to "everybody runs the tests on their laptop":**
+
+* **Enforced, not trusted.** The server refuses the merge; nobody has to remember, and "I forgot" or "it's a tiny change" no longer gets broken code into `main`.
+* **Same clean environment for everyone.** Tests run on a fresh Ubuntu runner from `uv.lock`, not on one person's laptop with extra packages, local data or a different OS (my own laptop even has a broken pytest temp folder).
+* **Visible to reviewers.** The result is on the PR page, linked to the exact commit; a reviewer does not need to pull the branch to know it passes.
+* **`main` is always green**, so every commit on `main` is deployable and its image (tagged with the SHA) has passed the same checks.
+
+**In simple terms: the pipeline becomes the gatekeeper of `main`, instead of everyone's good intentions.**
 
 ---
 
@@ -253,14 +290,14 @@ flowchart TD
         J["Alias champion = MODEL VERSION"]:::decide
         K["Alias challenger (rejected candidate)"]:::auto
         G --> H --> I
-        I -- "passes" --> J
-        I -- "fails" --> K
+        I -->|passes| J
+        I -->|fails| K
     end
 
     L["Deploy: docker pull ghcr.io/...:SHA, then docker run / compose up (or compose restart inference)"]:::human
     M["Running container: serve.py loads models:/food11@champion at startup"]:::auto
     F --> L --> M
-    J -. "fetched at container start" .-> M
+    J -.->|fetched at container start| M
 
     classDef auto fill:#d4edda,stroke:#2e7d32,color:#000
     classDef human fill:#ffe5cc,stroke:#e65100,color:#000
@@ -279,6 +316,27 @@ flowchart TD
 | Deployment | Human: `docker pull` the SHA tag and start it, or `docker compose restart inference` to pick up a new champion | |
 
 The code version and the model version are decided independently: a new image does not change the model, and moving `champion` does not need a new image (only a restart, Lab 4 Q9).
+
+**Checked end to end.** Merging PR #1 started run #6 on `main`: `test` 31 s, `smoke` 1 min 30 s, `push` 3 min 44 s (first build, 0 % layer cache), 5 min 55 s in total. The image appeared under the repository's **Packages** and I pulled it on my laptop without logging in (the package is public, like the repo):
+
+```text
+$ docker pull ghcr.io/marckhat/mlops-lab-1:bbb98f6c4c46e77bfcec9da05bda21a2a9a69439
+Digest: sha256:b822a495b84d343a91804b2a3aade0f5fcbe8b8c0ceaaefbc2e4c8493245208b
+Status: Downloaded newer image for ghcr.io/marckhat/mlops-lab-1:bbb98f6c4c46e77bfcec9da05bda21a2a9a69439
+```
+
+Then I ran **that exact image** on the Compose network, pointing at the Lab 4 mlflow service:
+
+```text
+$ docker run -d --network mlops-lab-1_default -p 8002:8000 -e MLFLOW_TRACKING_URI=http://mlflow:5000 ghcr.io/marckhat/mlops-lab-1:bbb98f6c...
+Loading model: models:/food11@champion
+Model loaded successfully.
+$ curl localhost:8002/health                                   -> {"status":"ok","model_loaded":true}
+$ curl -X POST -F "file=@tests/fixtures/bread.jpg" localhost:8002/predict
+{"category":"Fried food","confidence":0.6134352684020996}
+```
+
+The code came from CI (commit `bbb98f6`), the model from the registry (`champion` = version 2). The champion predicts *Fried food* for this bread image (the same answer as in Lab 4), while the unit test with the fake model says *Bread*: exactly the difference described in Q2.
 
 ---
 
