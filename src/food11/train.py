@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 from pathlib import Path
 
@@ -45,6 +46,15 @@ def parse_args():
     )
 
     return parser.parse_args()
+
+
+def folder_fingerprint(folder):
+    """MD5 of every file path and content in a folder: changes if any image changes."""
+    digest = hashlib.md5()
+    for path in sorted(p for p in Path(folder).rglob("*") if p.is_file()):
+        digest.update(path.relative_to(folder).as_posix().encode())
+        digest.update(hashlib.md5(path.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def create_data_loaders(dataset_root, batch_size):
@@ -233,6 +243,9 @@ def main():
                 "num_classes": len(train_dataset.classes),
                 # Needed by promote.py to compute the standard error of test_accuracy.
                 "test_size": len(test_dataset),
+                # Identifies the exact test images: promote.py only compares runs
+                # whose accuracy was measured on the same test set.
+                "test_set_md5": folder_fingerprint(dataset_root / "evaluation"),
             }
         )
 

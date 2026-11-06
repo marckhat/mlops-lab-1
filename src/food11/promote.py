@@ -10,8 +10,13 @@ Otherwise the candidate gets the `challenger` alias and `champion` stays put.
 In both cases the decision and both accuracies are written as tags on the
 candidate version.
 
+The two accuracies are only compared if they were measured on the same test
+images (same `dataset` and `test_set_md5` params). If the data changed, the gate
+refuses to decide; `--rebaseline` then makes the candidate champion on purpose.
+
 Usage:
     uv run python src/food11/promote.py --version 8
+    uv run python src/food11/promote.py --version 8 --rebaseline   # after a data change
 """
 
 import argparse
@@ -77,12 +82,66 @@ def get_metric(client: MlflowClient, run_id: str, metric: str, label: str) -> fl
     return metrics[metric]
 
 
+def comparison_problem(champion_params: dict, candidate_params: dict) -> str | None:
+    """Why the two runs' accuracies cannot be compared, or None if they can.
+
+    Accuracies are only comparable when measured on the same test images.
+    """
+    champion_data = champion_params.get("dataset")
+    candidate_data = candidate_params.get("dataset")
+    if champion_data and candidate_data and champion_data != candidate_data:
+        return f"champion was tested on '{champion_data}', candidate on '{candidate_data}'"
+
+    champion_md5 = champion_params.get("test_set_md5")
+    candidate_md5 = candidate_params.get("test_set_md5")
+    if champion_md5 != candidate_md5:
+        # Includes the case where only one run has a fingerprint: runs from
+        # before the fingerprint existed were tested on older data.
+        return (
+            f"different test sets (champion test_set_md5={champion_md5}, "
+            f"candidate test_set_md5={candidate_md5})"
+        )
+    return None
+
+
+def rebaseline(client, name, candidate, champion, acc_candidate, problem) -> None:
+    """Make the candidate champion of a new test set (explicit human decision)."""
+    client.set_registered_model_alias(name, CHAMPION, candidate.version)
+    # Challengers were measured on the old test set: they are no longer comparable.
+    try:
+        old_challenger = client.get_model_version_by_alias(name, CHALLENGER).version
+        client.delete_registered_model_alias(name, CHALLENGER)
+        print(f"Removed '{CHALLENGER}' from version {old_challenger} (old test set).")
+    except MlflowException:
+        pass
+    tags = {
+        "gate_decision": "rebaseline",
+        "gate_reason": problem,
+        "gate_candidate_accuracy": f"{acc_candidate:.4f}",
+        "gate_champion_version": str(champion.version),
+    }
+    for key, value in tags.items():
+        client.set_model_version_tag(name, candidate.version, key, value)
+    print(f"REBASELINE: {problem}.")
+    print(
+        f"'{CHAMPION}' now points to version {candidate.version} "
+        f"({acc_candidate:.4f} on the new test set); previous champion was version "
+        f"{champion.version}."
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Apply the quality gate to a model version.")
     parser.add_argument("--version", type=int, required=True, help="candidate model version")
     parser.add_argument("--model-name", default=MODEL_NAME)
     parser.add_argument("--metric", default="test_accuracy")
     parser.add_argument("--n-test", type=int, default=None, help="size of the test split")
+    parser.add_argument(
+        "--rebaseline",
+        action="store_true",
+        help="human decision: if the candidate was tested on a different test set "
+        "(the data changed), make it the champion without comparing accuracies",
+    )
     parser.add_argument(
         "--tracking-uri",
         default=os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"),
@@ -121,12 +180,15 @@ def main(argv=None) -> None:
 
     champion_run = client.get_run(champion.run_id)
     candidate_run = client.get_run(candidate.run_id)
-    champion_data = champion_run.data.params.get("dataset")
-    candidate_data = candidate_run.data.params.get("dataset")
-    if champion_data and candidate_data and champion_data != candidate_data:
+    problem = comparison_problem(champion_run.data.params, candidate_run.data.params)
+    if problem and args.rebaseline:
+        rebaseline(client, name, candidate, champion, acc_candidate, problem)
+        return
+    if problem:
         sys.exit(
-            f"Not comparable: champion was tested on '{champion_data}', "
-            f"candidate on '{candidate_data}'."
+            f"Not comparable: {problem}.\n"
+            "The gate cannot decide. If the data changed on purpose, run again with "
+            "--rebaseline to make this version the champion of the new test set."
         )
 
     acc_champion = get_metric(client, champion.run_id, args.metric, "champion")

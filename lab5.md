@@ -4,12 +4,12 @@
 
 | File | Purpose |
 |---|---|
-| `src/food11/data.py` | Refactored: `CLASSES`, `category_from_filename()`, `resize_image()` are pure functions; the copy loop only runs under `if __name__ == "__main__":`. `resize_image()` now also converts to RGB. |
+| `src/food11/data.py` | Refactored: `CLASSES`, `category_from_filename()`, `resize_image()` are pure functions; the copy loop only runs under `if __name__ == "__main__":`. `resize_image()` now also converts to RGB. After the lab, `find_duplicates()` removes the train/test leak (see the last section). |
 | `src/food11/serve.py` | The model lives in a module-level `model` variable, loaded at startup only if `SKIP_MODEL` is not set. `/health` always answers 200; `/predict` returns 503 when no model is loaded. |
 | `src/food11/validate_data.py` | Data contract: 5 checks, PASS/FAIL report, exit code 1 on failure. |
-| `src/food11/promote.py` | Quality gate that moves the `champion` alias only if the candidate is better by at least 2 standard errors. |
-| `src/food11/train.py` | Small additions: reads `MLFLOW_TRACKING_URI` from the environment, logs `test_size`, and `--register` registers the model as a new `food11` version. |
-| `tests/` | 19 tests: data functions, API with a fake model, the data contract on a synthetic dataset, and the gate rule. `tests/fixtures/bread.jpg` is a 4 kB image from the mini dataset, committed to git. |
+| `src/food11/promote.py` | Quality gate that moves the `champion` alias only if the candidate is better by at least 2 standard errors. It refuses to compare runs measured on different test sets; `--rebaseline` is the explicit way out after a data change. |
+| `src/food11/train.py` | Small additions: reads `MLFLOW_TRACKING_URI` from the environment, logs `test_size` and `test_set_md5` (a fingerprint of the test images), and `--register` registers the model as a new `food11` version. |
+| `tests/` | 23 tests: data functions, API with a fake model, the data contract on a synthetic dataset, and the gate rule (plus duplicate removal and test-set comparability). `tests/fixtures/bread.jpg` is a 4 kB image from the mini dataset, committed to git. |
 | `.github/workflows/ci.yml` | `test` → `smoke` → `push` (main only, to ghcr.io, tagged with the commit SHA). |
 | `scripts/register_model.py` | (Lab 4 script) now also copies `test_accuracy`, `dataset` and `test_size` from the source run, so imported models can be compared by the gate. |
 
@@ -79,7 +79,7 @@ Data contract for data\food11_processed_mini
 FAILED: 1 of 5 checks failed
 ```
 
-On the full `food11_processed` (16,643 images) it finds **611** images shared between splits. I checked the raw Kaggle files with the same MD5 method: the 611 groups are **byte-identical in `food11_raw`** too (249 training/evaluation, 51 training/validation, 311 validation/evaluation), always with the same label. So the leak comes from the source dataset, not from `data.py`. I did not change the data for this lab; see "Follow-up" at the end.
+On the full `food11_processed` (16,643 images) it finds **611** images shared between splits. I checked the raw Kaggle files with the same MD5 method: the 611 groups are **byte-identical in `food11_raw`** too (249 training/evaluation, 51 training/validation, 311 validation/evaluation), always with the same label. So the leak comes from the source dataset, not from `data.py`. After answering the lab questions I fixed it in `data.py`; see "Fix: removing the train/test leak" at the end.
 
 **Then the deliberate break.** I copied `training/Bread/0_0.jpg` to `evaluation/Bread/copy_of_0_0.jpg`:
 
@@ -252,7 +252,7 @@ REJECTED: version 4 is now 'challenger'; 'champion' stays on version 2.
 
 **The promote path.** Since neither real candidate passed, I also ran `promote.py` against a throwaway MLflow database (`sqlite:///.../gate.db`, not the real registry) with a champion at 0.7518 and a candidate at 0.80: the result was `PROMOTED: 'champion' now points to version 2`, its old `challenger` alias was removed, and its tags say `gate_decision=promoted`. A following candidate at 0.76 was then rejected against the new threshold 0.8242.
 
-**Caveat:** these test accuracies are measured on an evaluation split that shares images with training (Question 3), so they are optimistic for every model, and the gate compares them on the same footing.
+**Caveat:** these test accuracies were measured on the original (leaky) evaluation split (Question 3), the same one for every model, so the comparison was fair but the numbers are optimistic. After the lab I removed the leak and re-baselined the champion on the clean split (0.7436, see the last section).
 
 ---
 
@@ -340,6 +340,70 @@ The code came from CI (commit `bbb98f6`), the model from the registry (`champion
 
 ---
 
-## Follow-up: the train/test leak in Food-11
+## Fix: removing the train/test leak
 
-The data contract found 611 byte-identical images shared between splits in the original Food-11 data (43 in the mini dataset). The proper fix is in the pipeline, not by hand: make `data.py` drop from `validation`/`evaluation` every image whose MD5 already appears in an earlier split, regenerate the processed datasets, check that `validate_data.py` passes, then `dvc add data` + `dvc push`. Because the test split changes, all models (including the champion) would have to be re-evaluated on the new split before the gate compares them again.
+The data contract (Q3) found byte-identical images in several splits of the original Food-11 data. I fixed it **in the pipeline**, not by hand, so the fix is reproducible and versioned.
+
+**1. `data.py` removes the duplicates.** `find_duplicates()` reads the raw splits in the order `training`, `evaluation`, `validation`, hashes every file (MD5), and marks each repeated content as a duplicate. A duplicated image is therefore kept once: training stays complete, and the test split wins over validation. Then the usual resize/sort runs and skips the duplicates.
+
+```text
+$ uv run python src/food11/data.py
+training: dropping 5 duplicated images        (repeats inside training)
+validation: dropping 365 duplicated images
+evaluation: dropping 253 duplicated images
+Finished creating datasets.
+```
+
+| Split (full `food11_processed`) | Before | After |
+|---|---|---|
+| training | 9,866 | 9,861 |
+| validation | 3,430 | 3,065 |
+| evaluation | 3,347 | 3,094 |
+| **total** | **16,643** | **16,020** |
+
+The mini dataset keeps its size (1,100 / 1,096 / 1,096, at most 100 per class), but 88 validation and 84 evaluation images were replaced by the next non-duplicated ones. Its training split did not change.
+
+**2. The data contract now passes** on both datasets:
+
+```text
+$ uv run python src/food11/validate_data.py data/food11_processed
+  PASS  1. class folders - 11 classes expected in each of 3 splits
+  PASS  2. images RGB 128x128 - 16020 images checked, 0 bad
+  PASS  3. at least 50 images per class - smallest class has 96 images
+  PASS  4. no image in two splits - 0 images shared between splits
+  PASS  5. class shares train vs val within 5% - largest gap 2.5%
+PASSED: all 5 checks passed
+```
+
+(Same for `food11_processed_mini`, largest gap 0.3%.)
+
+**3. Versioned with DVC.** `dvc add data` changed the pointer in `data.dvc` from `94afad23...dir` (36,578 files) to `99db4c21...dir` (35,955 files), then `dvc push` to DagsHub. All 16,020 remaining processed images are byte-identical to before, so DVC stores them once; only the folder manifest is new. `git checkout <old commit> && dvc checkout` still brings back the leaky version (Lab 1 Q8).
+
+**4. The gate refuses to compare different test sets.** A model's `test_accuracy` is only meaningful together with *which* test images it was measured on. `train.py` now logs `test_set_md5`, a fingerprint of every file in the `evaluation` folder, and `promote.py` refuses to compare a candidate with a champion whose fingerprint differs (or is missing):
+
+```text
+$ uv run python src/food11/promote.py --version 5
+Not comparable: different test sets (champion test_set_md5=None, candidate test_set_md5=d45f1fd4b2ea5289ffa23249633b0843).
+The gate cannot decide. If the data changed on purpose, run again with --rebaseline to make this version the champion of the new test set.
+```
+
+**5. Re-baseline on the clean data.** I retrained the best settings (lr 1e-4, batch 32, 5 epochs, mini) on the clean data as **version 5** and made it champion on purpose:
+
+```text
+$ uv run python src/food11/promote.py --version 5 --rebaseline
+Removed 'challenger' from version 4 (old test set).
+REBASELINE: different test sets (...)
+'champion' now points to version 5 (0.7436 on the new test set); previous champion was version 2.
+```
+
+Version 5 has the tags `gate_decision=rebaseline` and `gate_reason=...`, so the registry records that this was a human decision after a data change, not a gate decision.
+
+| | Leaky mini data (v2 / v4) | Clean mini data (v5) |
+|---|---|---|
+| `train_loss` (epoch 5) | 0.0383 | 0.0383 (same training set, same seed: same model) |
+| `val_accuracy` | 0.7263 | 0.7181 |
+| `test_accuracy` | 0.7518 (824/1096) | **0.7436** (815/1096) |
+
+The model is the same; only the test images changed, and the test accuracy dropped by 0.8 points. On the mini set the direct leak was small: only 3 of the old 1,096 test images were copies of mini *training* images (the other replaced images were duplicates of full-dataset images outside the mini sample). So most of the 0.8 points come from testing on 84 different images, and the change is well inside the gate's noise band (2 × se ≈ 2.6 points). On the full dataset the leak is much larger (249 evaluation images were copies of training images), so models trained on `food11_processed` would have been more over-estimated.
+
+From now on, the gate compares candidates against **0.7436 + 2 × sqrt(0.7436 × 0.2564 / 1096) ≈ 0.7700**, on the clean test set. The serving container picks up version 5 at its next start (`docker compose restart inference`).

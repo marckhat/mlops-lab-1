@@ -6,10 +6,15 @@ resized to 128x128 RGB and sorted into one folder per class:
     data/food11_processed/<split>/<class>/*.jpg        (all images)
     data/food11_processed_mini/<split>/<class>/*.jpg   (at most 100 per class)
 
+The raw Food-11 data contains byte-identical images in several splits (a
+train/test leak). Each image is kept only once, in the first split of
+DEDUP_PRIORITY, so no image is in two splits.
+
 Usage:
     uv run python src/food11/data.py
 """
 
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -31,6 +36,9 @@ CLASSES = [
 ]
 
 SPLITS = ["training", "validation", "evaluation"]
+# A duplicated image is kept in the first split of this list and dropped from
+# the others: training stays complete, and the test split wins over validation.
+DEDUP_PRIORITY = ["training", "evaluation", "validation"]
 IMAGE_SIZE = 128
 MINI_PER_CLASS = 100
 
@@ -54,11 +62,33 @@ def resize_image(img: Image.Image, size: int = IMAGE_SIZE) -> Image.Image:
     return img.convert("RGB").resize((size, size))
 
 
-def prepare_split(split: str) -> None:
+def find_duplicates(raw_dir: Path, priority: list[str] = DEDUP_PRIORITY) -> set[Path]:
+    """Return the raw files to skip so that every image is kept only once.
+
+    Splits are read in `priority` order and files in name order; a file whose
+    content (MD5) was already seen is a duplicate.
+    """
+    seen = set()
+    duplicates = set()
+    for split in priority:
+        for path in sorted((raw_dir / split).glob("*")):
+            if not path.is_file():
+                continue
+            digest = hashlib.md5(path.read_bytes()).hexdigest()
+            if digest in seen:
+                duplicates.add(path)
+            else:
+                seen.add(digest)
+    return duplicates
+
+
+def prepare_split(split: str, skip: set[Path]) -> None:
     """Resize every raw image of one split into the processed and mini folders."""
     mini_counts = {name: 0 for name in CLASSES}
 
     for img_path in sorted((RAW_DIR / split).glob("*")):
+        if img_path in skip:
+            continue  # same image already kept in another split
         try:
             category = category_from_filename(img_path.name)
         except ValueError:
@@ -81,8 +111,11 @@ def main() -> None:
         if target.exists():
             shutil.rmtree(target)
 
+    duplicates = find_duplicates(RAW_DIR)
     for split in SPLITS:
-        prepare_split(split)
+        dropped = sum(1 for p in duplicates if p.parent.name == split)
+        print(f"{split}: dropping {dropped} duplicated images")
+        prepare_split(split, duplicates)
 
     print("Finished creating datasets.")
 
